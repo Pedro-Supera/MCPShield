@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "mcpshield"
 version = "0.1.0"
-description = "Static security scanner for MCP configurations and AI agent skills"
+description = "Static security scanner and Python capability inventory for MCP servers and AI agent skills"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }

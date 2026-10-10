@@ -1,8 +1,10 @@
 # MCPShield
 
-**Security scanner for MCP server configurations and AI agent skills.**
+**Static security and capability inventory for MCP servers and AI agent skills.**
 
 MCPShield statically inspects local JSON configuration files and files named `SKILL.md` for risky command patterns, possible hardcoded credentials, and suspicious instructions. It reports findings with severity, evidence, and remediation guidance.
+
+It can also parse local Python source to inventory MCP-style tool decorators, trace uniquely resolved direct calls to local functions, and report selected process, filesystem, and network API calls with source locations.
 
 > **Status: early development.** Detection rules are heuristic. They may produce false positives or miss risks, so MCPShield is not a substitute for a security review.
 
@@ -12,6 +14,10 @@ MCPShield statically inspects local JSON configuration files and files named `SK
 - Checks for risky shell patterns, instruction overrides, SSH-directory references, and possible hardcoded credentials.
 - Redacts likely credential values from finding evidence.
 - Prints human-readable output or JSON.
+- Analyzes Python source with the standard-library AST parser, without importing or executing it.
+- Recognizes functions decorated with an attribute named `.tool` as a heuristic MCP tool convention.
+- Follows unique direct local function calls and reports selected process, filesystem, and network capabilities with evidence locations.
+- Labels source observations as potential capabilities; it does not infer malicious intent or prove runtime behavior.
 - Does not execute scanned files or contact configured servers.
 - Has no runtime dependencies beyond the Python standard library.
 
@@ -33,9 +39,19 @@ python -m pip install -e ".[dev]"
 mcpshield ./path/to/config.json
 mcpshield ./path/to/skills/
 mcpshield ./path/to/project --json
+mcpshield ./path/to/python-server --analyze-python
+mcpshield ./path/to/python-server --analyze-python --json
 ```
 
-Exit codes: `0` means no rules matched, `1` means findings were reported, and `2` means the input could not be scanned. A clean result does not prove that a file or system is safe.
+For Python analysis, `--analyze-python` accepts a `.py` file or a directory. It emits an inventory of recognized tools, reachable local helper functions, observed API calls, unresolved calls, and parser/size issues. `--json` prints the report as JSON with `schema_version: 1`. This mode returns `2` when any source file has a syntax error or the input cannot be read; a clean/empty inventory does not prove that a server is safe.
+
+The first source-analysis version recognizes decorators whose final attribute is `tool` (for example, `@mcp.tool()`), follows direct calls only when the local target is unambiguous, and maps selected calls to:
+
+- **Process execution:** `subprocess` calls and selected `os` process APIs.
+- **Filesystem access:** `open`, selected `os`/`pathlib.Path` operations, `shutil`, and `tempfile`.
+- **Network communication:** selected calls from `requests`, `httpx`, `urllib`, `urllib3`, `aiohttp`, and `socket`.
+
+Each capability means that a matching call expression was found in source. It is not proof that the call runs, succeeds, receives untrusted input, or is malicious. Unresolved calls are reported as unknown rather than guessed.
 
 ## Detection rules
 
@@ -54,10 +70,12 @@ These are small, explainable heuristics. They do not understand the complete sem
 ## Safety and limitations
 
 - Treat scanned files as untrusted text.
-- MCPShield does not execute commands, import scanned modules, start MCP servers, or make network requests.
+- MCPShield does not execute commands, import scanned modules, start MCP servers, or make network requests during either scan mode.
 - Likely credential values are redacted in finding evidence. Review reports before sharing them from sensitive environments.
-- Files larger than 1 MB are skipped; symbolic links are ignored during directory scans.
+- Files larger than 1 MB are skipped; symbolic links are ignored during directory scans. Python source analysis also skips common generated, hidden, and virtual-environment directories and stops after 5,000 source files.
 - Static pattern matching can miss obfuscated behavior and flag benign examples or documentation.
+- Python analysis does not resolve reflection, dynamic imports, generated code, indirect dispatch, or dependency internals. It follows only direct local calls with uniquely resolved targets; runtime configuration and control/data flow are not established.
+- Tool detection is heuristic and may match a non-MCP decorator named `.tool`, or miss other MCP registration styles.
 
 ## Development
 
@@ -69,7 +87,8 @@ GitHub Actions tests Python 3.10–3.13.
 
 ## Roadmap
 
-- [ ] Parse MCP configuration structures and flag risky server-launch settings.
+- [ ] Expand MCP tool registration support based on real-world Python fixtures.
+- [ ] Improve import-aware call resolution without treating ambiguous calls as confirmed.
 - [ ] Add regression fixtures for benign and suspicious examples.
 - [ ] Add SARIF output for code-scanning workflows.
 - [ ] Document every rule with examples and limitations.
