@@ -5,6 +5,7 @@ import re
 
 from mcpshield.models import Finding
 from mcpshield.rules import matching_rules
+from mcpshield.safe_io import read_limited_text
 
 MAX_FILE_BYTES = 1_000_000
 _SECRET_VALUE_RE = re.compile(
@@ -72,9 +73,9 @@ def scan_path(path: str | Path) -> list[Finding]:
     findings: list[Finding] = []
     for candidate in sorted(candidates):
         try:
-            if candidate.stat().st_size > MAX_FILE_BYTES:
+            content = read_limited_text(candidate, MAX_FILE_BYTES)
+            if content is None:
                 continue
-            content = candidate.read_text(encoding="utf-8", errors="replace")
         except OSError as exc:
             raise ScanError(f"Could not read {candidate}: {exc}") from exc
         findings.extend(scan_text(content, path=str(candidate)))
