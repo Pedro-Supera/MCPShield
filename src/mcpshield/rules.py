@@ -51,6 +51,12 @@ RULES = (
         re.compile(r"(?:~[/\\]\.ssh|/home/[^\s/]+/\.ssh|/root/\.ssh)", re.I),
         "Avoid broad access to ~/.ssh. If access is essential, restrict it to a specific public-key file and review the use.",
     ),
+    Rule(
+        "MCP007", "high", "Possible hardcoded credential",
+        "A value assigned to a credential-like key appears to be a literal secret rather than an environment variable placeholder.",
+        re.compile(r"""(?i)\b(api[_-]?key|access[_-]?token|client[_-]?secret|password|secret)\b\s*["']?\s*[:=]\s*["'](?!\$\{|<|REDACTED|YOUR_|CHANGE_ME|CHANGEME)[^"'\r\n]{8,}["']"""),
+        "Move credentials to a secret manager or environment variable. Rotate the value if it has been committed or shared.",
+    ),
 )
 
 
