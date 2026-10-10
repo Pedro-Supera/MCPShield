@@ -6,6 +6,8 @@ from dataclasses import asdict, dataclass
 import os
 from pathlib import Path
 
+from mcpshield.safe_io import read_limited_text
+
 
 MAX_FILE_BYTES = 1_000_000
 MAX_FILES = 5_000
@@ -24,16 +26,23 @@ _IGNORED_DIRECTORIES = {
     "venv",
 }
 _PROCESS_CALLS = {
+    "asyncio.create_subprocess_exec",
+    "asyncio.create_subprocess_shell",
     "os.popen",
     "os.system",
+    "os.fork",
+    "os.forkpty",
+    "os.startfile",
 }
 _FILESYSTEM_CALLS = {
     "builtins.open",
+    "open",
     "io.open",
     "os.chmod",
     "os.listdir",
     "os.mkdir",
     "os.open",
+    "os.read",
     "os.remove",
     "os.rename",
     "os.replace",
@@ -42,6 +51,7 @@ _FILESYSTEM_CALLS = {
     "os.stat",
     "os.unlink",
     "os.walk",
+    "os.write",
 }
 _PATH_METHODS = {
     "chmod",
@@ -145,6 +155,9 @@ class _Function:
     description: str | None
     tool_name: str | None
     aliases: dict[str, str]
+    parent_scope: tuple[str, ...]
+    parent_functions: tuple[str, ...]
+    local_names: frozenset[str]
     calls: tuple[_Call, ...]
 
 
@@ -152,11 +165,26 @@ class _FunctionCallVisitor(ast.NodeVisitor):
     def __init__(self, aliases: dict[str, str]) -> None:
         self.aliases = aliases
         self.calls: list[_Call] = []
+        self.local_names: set[str] = set()
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         return
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        return
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        self.local_names.add(node.name)
+
+    def visit_Import(self, node: ast.Import) -> None:
+        for alias in node.names:
+            self.local_names.add(alias.asname or alias.name.split(".")[0])
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        for alias in node.names:
+            self.local_names.add(alias.asname or alias.name)
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
         return
 
     def visit_Call(self, node: ast.Call) -> None:
@@ -170,6 +198,10 @@ class _FunctionCallVisitor(ast.NodeVisitor):
             )
         )
         self.generic_visit(node)
+
+    def visit_Name(self, node: ast.Name) -> None:
+        if isinstance(node.ctx, (ast.Store, ast.Del)):
+            self.local_names.add(node.id)
 
 
 def _expression_name(node: ast.expr) -> str:
@@ -198,7 +230,26 @@ def _call_expression(node: ast.expr, aliases: dict[str, str]) -> str:
     return ""
 
 
-def _import_aliases(tree: ast.Module) -> dict[str, str]:
+def _relative_import_module(
+    module: str, level: int, current_module: str, *, is_package_init: bool = False
+) -> str:
+    if level == 0:
+        return module
+    package = (
+        current_module.split(".")
+        if is_package_init
+        else current_module.split(".")[:-1]
+    )
+    if level > len(package):
+        return f"{'.' * level}{module}"
+    package = package[: max(0, len(package) - level + 1)]
+    prefix = ".".join(package)
+    return ".".join(part for part in (prefix, module) if part)
+
+
+def _import_aliases(
+    tree: ast.Module, current_module: str, *, is_package_init: bool = False
+) -> dict[str, str]:
     aliases: dict[str, str] = {}
     for node in tree.body:
         if isinstance(node, ast.Import):
@@ -206,10 +257,18 @@ def _import_aliases(tree: ast.Module) -> dict[str, str]:
                 local_name = alias.asname or alias.name.split(".")[0]
                 imported_name = alias.name if alias.asname else local_name
                 aliases[local_name] = imported_name
-        elif isinstance(node, ast.ImportFrom) and node.module:
+        elif isinstance(node, ast.ImportFrom):
+            imported_module = _relative_import_module(
+                node.module or "",
+                node.level,
+                current_module,
+                is_package_init=is_package_init,
+            )
             for alias in node.names:
                 local_name = alias.asname or alias.name
-                aliases[local_name] = f"{node.module}.{alias.name}"
+                aliases[local_name] = ".".join(
+                    part for part in (imported_module, alias.name) if part
+                )
     return aliases
 
 
@@ -235,6 +294,7 @@ def _function_records(
     class FunctionVisitor(ast.NodeVisitor):
         def __init__(self) -> None:
             self.parents: list[str] = []
+            self.function_scopes: list[str] = []
 
         def _visit_function(
             self, node: ast.FunctionDef | ast.AsyncFunctionDef
@@ -243,6 +303,13 @@ def _function_records(
             visitor = _FunctionCallVisitor(aliases)
             for statement in node.body:
                 visitor.visit(statement)
+            visitor.local_names.update(argument.arg for argument in node.args.posonlyargs)
+            visitor.local_names.update(argument.arg for argument in node.args.args)
+            visitor.local_names.update(argument.arg for argument in node.args.kwonlyargs)
+            if node.args.vararg:
+                visitor.local_names.add(node.args.vararg.arg)
+            if node.args.kwarg:
+                visitor.local_names.add(node.args.kwarg.arg)
             functions.append(
                 _Function(
                     module=module,
@@ -253,11 +320,16 @@ def _function_records(
                     description=ast.get_docstring(node),
                     tool_name=_tool_name(node),
                     aliases=aliases,
+                    parent_scope=tuple(self.parents),
+                    parent_functions=tuple(self.function_scopes),
+                    local_names=frozenset(visitor.local_names),
                     calls=tuple(visitor.calls),
                 )
             )
             self.parents.append(node.name)
+            self.function_scopes.append(qualified_name)
             self.generic_visit(node)
+            self.function_scopes.pop()
             self.parents.pop()
 
         def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
@@ -310,13 +382,16 @@ def _module_name(relative_path: str) -> str:
     return ".".join(parts)
 
 
-def _python_files(target: Path) -> tuple[list[Path], bool]:
+def _python_files(target: Path) -> tuple[list[Path], bool, list[OSError]]:
     if target.is_file():
-        return ([target] if target.suffix.lower() == ".py" else []), False
+        return ([target] if target.suffix.lower() == ".py" else []), False, []
 
     files: list[Path] = []
     truncated = False
-    for root, directories, filenames in os.walk(target, followlinks=False):
+    traversal_errors: list[OSError] = []
+    for root, directories, filenames in os.walk(
+        target, followlinks=False, onerror=traversal_errors.append
+    ):
         directories[:] = sorted(
             directory
             for directory in directories
@@ -330,9 +405,13 @@ def _python_files(target: Path) -> tuple[list[Path], bool]:
                 continue
             if len(files) == MAX_FILES:
                 truncated = True
-                return files, truncated
+                return files, truncated, traversal_errors
             files.append(candidate)
-    return files, truncated
+    return files, truncated, traversal_errors
+
+
+def _function_id(function: _Function) -> str:
+    return f"{function.path}:{function.line}:{function.qualified_name}"
 
 
 def _resolve_call(
@@ -341,12 +420,29 @@ def _resolve_call(
     functions_by_module_name: dict[tuple[str, str], list[_Function]],
 ) -> _Function | None:
     if "." in call.normalized_expression:
+        local_module = call.expression.partition(".")[0]
+        if local_module not in caller.aliases:
+            return None
         module, _, name = call.normalized_expression.rpartition(".")
         imported_function = functions_by_module_name.get((module, name), [])
         return imported_function[0] if len(imported_function) == 1 else None
-    same_module = functions_by_module_name.get(
-        (caller.module, call.normalized_expression), []
-    )
+    name = call.normalized_expression
+    scopes = [caller.qualified_name, *reversed(caller.parent_functions)]
+    for index in range(len(caller.parent_scope), 0, -1):
+        scopes.append(".".join(caller.parent_scope[:index]))
+    for scope in dict.fromkeys(scopes):
+        nested_matches = functions_by_module_name.get(
+            (caller.module, f"{scope}.{name}"), []
+        )
+        if len(nested_matches) == 1:
+            return nested_matches[0]
+        if nested_matches:
+            return None
+
+    if name in caller.local_names:
+        return None
+
+    same_module = functions_by_module_name.get((caller.module, name), [])
     if len(same_module) == 1:
         return same_module[0]
     return None
@@ -356,8 +452,9 @@ def _analyze_tool(
     tool: _Function,
     functions_by_module_name: dict[tuple[str, str], list[_Function]],
 ) -> ToolAnalysis:
+    tool_id = _function_id(tool)
     reached: dict[str, tuple[_Function, tuple[str, ...]]] = {
-        tool.qualified_name: (tool, (tool.qualified_name,))
+        tool_id: (tool, (tool.qualified_name,))
     }
     queue: deque[_Function] = deque([tool])
     capabilities: dict[
@@ -367,7 +464,8 @@ def _analyze_tool(
 
     while queue:
         current = queue.popleft()
-        chain = reached[current.qualified_name][1]
+        current_id = _function_id(current)
+        chain = reached[current_id][1]
         for call in current.calls:
             category = _capability(call.normalized_expression)
             if category:
@@ -384,15 +482,16 @@ def _analyze_tool(
 
             target = _resolve_call(call, current, functions_by_module_name)
             if target is None:
-                key = (current.qualified_name, call.expression, call.line)
+                key = (current_id, call.expression, call.line)
                 unresolved[key] = UnresolvedCall(
                     caller=current.qualified_name,
                     expression=call.expression,
                     path=current.path,
                     line=call.line,
                 )
-            elif target.qualified_name not in reached:
-                reached[target.qualified_name] = (
+            elif _function_id(target) not in reached:
+                target_id = _function_id(target)
+                reached[target_id] = (
                     target,
                     (*chain, target.qualified_name),
                 )
@@ -405,7 +504,11 @@ def _analyze_tool(
         line=tool.line,
         description=tool.description,
         reachable_functions=tuple(
-            sorted(name for name in reached if name != tool.qualified_name)
+            sorted(
+                function.qualified_name
+                for identifier, (function, _) in reached.items()
+                if identifier != tool_id
+            )
         ),
         capabilities=tuple(
             sorted(
@@ -439,15 +542,32 @@ def analyze_python_path(path: str | Path) -> AnalysisReport:
         raise PythonAnalysisError(f"Not a Python source file: {target}")
 
     root = target if target.is_dir() else target.parent
-    candidates, truncated = _python_files(target)
+    candidates, truncated, traversal_errors = _python_files(target)
     functions: list[_Function] = []
     issues: list[AnalysisIssue] = []
     files_scanned = 0
 
+    for error in traversal_errors:
+        error_path = Path(error.filename) if error.filename else target
+        try:
+            relative_path = error_path.relative_to(root).as_posix()
+        except ValueError:
+            relative_path = "."
+        issues.append(
+            AnalysisIssue(
+                relative_path,
+                None,
+                "directory_read_error",
+                error.strerror or "Could not inspect directory.",
+                "warning",
+            )
+        )
+
     for candidate in candidates:
         relative_path = candidate.relative_to(root).as_posix()
         try:
-            if candidate.stat().st_size > MAX_FILE_BYTES:
+            source = read_limited_text(candidate, MAX_FILE_BYTES)
+            if source is None:
                 issues.append(
                     AnalysisIssue(
                         relative_path,
@@ -458,9 +578,17 @@ def analyze_python_path(path: str | Path) -> AnalysisReport:
                     )
                 )
                 continue
-            source = candidate.read_text(encoding="utf-8", errors="replace")
         except OSError as exc:
-            raise PythonAnalysisError(f"Could not read {candidate}: {exc}") from exc
+            issues.append(
+                AnalysisIssue(
+                    relative_path,
+                    None,
+                    "file_read_error",
+                    exc.strerror or str(exc),
+                    "error",
+                )
+            )
+            continue
 
         files_scanned += 1
         try:
@@ -476,11 +604,36 @@ def analyze_python_path(path: str | Path) -> AnalysisReport:
                 )
             )
             continue
+        except (RecursionError, ValueError) as exc:
+            issues.append(
+                AnalysisIssue(
+                    relative_path,
+                    None,
+                    "parse_error",
+                    str(exc) or "Python parser could not analyze this file.",
+                    "error",
+                )
+            )
+            continue
 
-        aliases = _import_aliases(tree)
-        functions.extend(
-            _function_records(tree, relative_path, _module_name(relative_path), aliases)
+        module = _module_name(relative_path)
+        aliases = _import_aliases(
+            tree, module, is_package_init=Path(relative_path).name == "__init__.py"
         )
+        try:
+            functions.extend(
+                _function_records(tree, relative_path, module, aliases)
+            )
+        except RecursionError as exc:
+            issues.append(
+                AnalysisIssue(
+                    relative_path,
+                    None,
+                    "parse_error",
+                    str(exc) or "Python source is too deeply nested to analyze.",
+                    "error",
+                )
+            )
 
     if truncated:
         issues.append(
@@ -498,6 +651,10 @@ def analyze_python_path(path: str | Path) -> AnalysisReport:
         by_module_and_name.setdefault((function.module, function.name), []).append(
             function
         )
+        if function.qualified_name != function.name:
+            by_module_and_name.setdefault(
+                (function.module, function.qualified_name), []
+            ).append(function)
 
     tools = [
         _analyze_tool(function, by_module_and_name)
@@ -511,7 +668,7 @@ def analyze_python_path(path: str | Path) -> AnalysisReport:
         issues=tuple(issues),
         limitations=(
             "Tool detection is heuristic: any function decorated with an attribute named 'tool' is included.",
-            "Only direct calls to uniquely named local functions are followed.",
+            "Only direct calls to unambiguous functions in the same source module or explicitly imported project modules are followed.",
             "Observed API calls indicate potential capability in source, not runtime execution or malicious intent.",
             "Dynamic dispatch, reflection, generated code, runtime configuration, and dependency internals are not resolved.",
         ),

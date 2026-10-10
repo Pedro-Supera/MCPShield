@@ -73,8 +73,9 @@ These are small, explainable heuristics. They do not understand the complete sem
 - MCPShield does not execute commands, import scanned modules, start MCP servers, or make network requests during either scan mode.
 - Likely credential values are redacted in finding evidence. Review reports before sharing them from sensitive environments.
 - Files larger than 1 MB are skipped; symbolic links are ignored during directory scans. Python source analysis also skips common generated, hidden, and virtual-environment directories and stops after 5,000 source files.
+- Scanner inputs are opened as regular files with a byte limit enforced while reading; symbolic links are not followed. Filesystem and traversal errors are reported instead of being treated as clean results.
 - Static pattern matching can miss obfuscated behavior and flag benign examples or documentation.
-- Python analysis does not resolve reflection, dynamic imports, generated code, indirect dispatch, or dependency internals. It follows only direct local calls with uniquely resolved targets; runtime configuration and control/data flow are not established.
+- Python analysis does not resolve reflection, dynamic imports, generated code, indirect dispatch, or dependency internals. It follows only direct local calls with uniquely resolved targets, including statically identifiable relative imports; runtime configuration and control/data flow are not established.
 - Tool detection is heuristic and may match a non-MCP decorator named `.tool`, or miss other MCP registration styles.
 
 ## Development
