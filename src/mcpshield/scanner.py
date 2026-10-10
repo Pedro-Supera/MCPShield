@@ -1,16 +1,24 @@
 """Local, non-executing file and directory scanner."""
 
 from pathlib import Path
+import re
 
 from mcpshield.models import Finding
 from mcpshield.rules import matching_rules
 
-SUPPORTED_SUFFIXES = {".json", ".md"}
 MAX_FILE_BYTES = 1_000_000
+_SECRET_VALUE_RE = re.compile(
+    r"""(?i)(api[_-]?key|access[_-]?token|client[_-]?secret|password|secret)(\s*["']?\s*[:=]\s*["'])[^"'\r\n]+(["'])"""
+)
 
 
 class ScanError(Exception):
     """Raised when an input cannot be scanned safely."""
+
+
+def _redact_evidence(line: str) -> str:
+    """Redact likely credential values before including evidence in reports."""
+    return _SECRET_VALUE_RE.sub(r"\1\2[REDACTED]\3", line.strip())[:240]
 
 
 def scan_text(text: str, path: str = "<memory>") -> list[Finding]:
@@ -26,7 +34,7 @@ def scan_text(text: str, path: str = "<memory>") -> list[Finding]:
                     description=rule.description,
                     path=path,
                     line=line_number,
-                    evidence=line.strip()[:240],
+                    evidence=_redact_evidence(line),
                     recommendation=rule.recommendation,
                 )
             )
