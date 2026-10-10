@@ -339,7 +339,6 @@ def _resolve_call(
     call: _Call,
     caller: _Function,
     functions_by_module_name: dict[tuple[str, str], list[_Function]],
-    functions_by_name: dict[str, list[_Function]],
 ) -> _Function | None:
     if "." in call.normalized_expression:
         module, _, name = call.normalized_expression.rpartition(".")
@@ -350,16 +349,12 @@ def _resolve_call(
     )
     if len(same_module) == 1:
         return same_module[0]
-    if same_module:
-        return None
-    project_matches = functions_by_name.get(call.normalized_expression, [])
-    return project_matches[0] if len(project_matches) == 1 else None
+    return None
 
 
 def _analyze_tool(
     tool: _Function,
     functions_by_module_name: dict[tuple[str, str], list[_Function]],
-    functions_by_name: dict[str, list[_Function]],
 ) -> ToolAnalysis:
     reached: dict[str, tuple[_Function, tuple[str, ...]]] = {
         tool.qualified_name: (tool, (tool.qualified_name,))
@@ -387,9 +382,7 @@ def _analyze_tool(
                 )
                 continue
 
-            target = _resolve_call(
-                call, current, functions_by_module_name, functions_by_name
-            )
+            target = _resolve_call(call, current, functions_by_module_name)
             if target is None:
                 key = (current.qualified_name, call.expression, call.line)
                 unresolved[key] = UnresolvedCall(
@@ -501,15 +494,13 @@ def analyze_python_path(path: str | Path) -> AnalysisReport:
         )
 
     by_module_and_name: dict[tuple[str, str], list[_Function]] = {}
-    by_name: dict[str, list[_Function]] = {}
     for function in functions:
         by_module_and_name.setdefault((function.module, function.name), []).append(
             function
         )
-        by_name.setdefault(function.name, []).append(function)
 
     tools = [
-        _analyze_tool(function, by_module_and_name, by_name)
+        _analyze_tool(function, by_module_and_name)
         for function in functions
         if function.tool_name is not None
     ]

@@ -134,6 +134,25 @@ def load():
     assert tool.unresolved_calls[0].expression == "helper"
 
 
+def test_does_not_guess_unimported_cross_module_functions(tmp_path: Path):
+    (tmp_path / "server.py").write_text(
+        '''
+@mcp.tool()
+def load():
+    helper()
+''',
+        encoding="utf-8",
+    )
+    (tmp_path / "helpers.py").write_text(
+        "def helper():\n    return None\n", encoding="utf-8"
+    )
+
+    tool = analyze_python_path(tmp_path).tools[0]
+
+    assert tool.reachable_functions == ()
+    assert tool.unresolved_calls[0].expression == "helper"
+
+
 def test_syntax_errors_are_reported_and_other_files_still_analyzed(tmp_path: Path):
     (tmp_path / "broken.py").write_text("def broken(:\n", encoding="utf-8")
     (tmp_path / "server.py").write_text(
