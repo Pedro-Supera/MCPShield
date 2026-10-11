@@ -5,7 +5,9 @@ from pathlib import Path
 import stat
 
 
-def read_limited_text(path: Path, max_bytes: int) -> str | None:
+def read_limited_text(
+    path: Path, max_bytes: int, *, decode_errors: str = "replace"
+) -> str | None:
     """Read a regular file without following symlinks or exceeding ``max_bytes``.
 
     Returns ``None`` when the file is too large. The open file descriptor is
@@ -45,6 +47,6 @@ def read_limited_text(path: Path, max_bytes: int) -> str | None:
         content = b"".join(chunks)
         if len(content) > max_bytes:
             return None
-        return content.decode("utf-8", errors="replace")
+        return content.decode("utf-8", errors=decode_errors)
     finally:
         os.close(descriptor)

@@ -482,3 +482,377 @@ def test_reports_recursion_errors_during_ast_walk_and_continues(
     assert [(issue.path, issue.code) for issue in report.issues] == [
         ("deep.py", "parse_error")
     ]
+
+
+def test_local_imports_inside_tool_functions_resolve_capabilities(tmp_path: Path):
+    source = tmp_path / "server.py"
+    source.write_text(
+        '''
+@mcp.tool()
+def run(command):
+    from subprocess import run as launch
+    return launch(command)
+''',
+        encoding="utf-8",
+    )
+
+    tool = analyze_python_path(source).tools[0]
+
+    assert [item.api for item in tool.capabilities] == ["subprocess.run"]
+    assert tool.data_flows[0].source_parameters == ("command",)
+
+
+def test_shadowed_api_names_are_not_treated_as_imported_capabilities(tmp_path: Path):
+    source = tmp_path / "server.py"
+    source.write_text(
+        '''
+import subprocess
+
+@mcp.tool()
+def run(subprocess):
+    subprocess.run(["not a real subprocess API"])
+''',
+        encoding="utf-8",
+    )
+
+    tool = analyze_python_path(source).tools[0]
+
+    assert tool.capabilities == ()
+    assert tool.unresolved_calls[0].expression == "subprocess.run"
+
+
+def test_project_module_shadowing_does_not_claim_external_api(tmp_path: Path):
+    (tmp_path / "server.py").write_text(
+        '''
+import requests
+
+@mcp.tool()
+def fetch():
+    requests.get("https://example.invalid")
+''',
+        encoding="utf-8",
+    )
+    (tmp_path / "requests.py").write_text(
+        "def get(url):\n    return url\n", encoding="utf-8"
+    )
+
+    tool = analyze_python_path(tmp_path).tools[0]
+
+    assert tool.capabilities == ()
+    assert tool.reachable_functions == ("get",)
+
+
+def test_follows_direct_self_method_calls_and_emits_stable_function_locations(
+    tmp_path: Path,
+):
+    source = tmp_path / "server.py"
+    source.write_text(
+        '''
+from pathlib import Path
+
+class Server:
+    @mcp.tool()
+    def read(self, path):
+        return self.load(path)
+
+    def load(self, path):
+        return Path(path).read_text()
+''',
+        encoding="utf-8",
+    )
+
+    tool = analyze_python_path(source).tools[0]
+
+    assert tool.reachable_functions == ("Server.load",)
+    assert tool.reachable_function_locations[0].path == "server.py"
+    assert tool.reachable_function_locations[0].id.endswith(":Server.load")
+    assert tool.capabilities[0].call_chain == ("Server.read", "Server.load")
+    assert len(tool.capabilities[0].call_chain_ids) == 2
+
+
+def test_recognizes_imperative_tool_registration(tmp_path: Path):
+    source = tmp_path / "server.py"
+    source.write_text(
+        '''
+def inspect_data(path):
+    return open(path).read()
+
+mcp.add_tool(inspect_data, name="inspect")
+''',
+        encoding="utf-8",
+    )
+
+    report = analyze_python_path(source)
+
+    assert len(report.tools) == 1
+    assert report.tools[0].name == "inspect"
+    assert report.tools[0].capabilities[0].api == "builtins.open"
+
+
+def test_reports_tool_parameter_flow_through_local_helper_to_process_sink(
+    tmp_path: Path,
+):
+    source = tmp_path / "server.py"
+    source.write_text(
+        '''
+import subprocess
+
+@mcp.tool()
+def run(command):
+    return helper(command)
+
+def helper(value):
+    return subprocess.run(value)
+''',
+        encoding="utf-8",
+    )
+
+    flow = analyze_python_path(source).tools[0].data_flows[0]
+
+    assert flow.rule_id == "MCP201"
+    assert flow.source_parameters == ("command",)
+    assert flow.sink_api == "subprocess.run"
+    assert flow.call_chain == ("run", "helper")
+    assert flow.confidence == "low"
+    assert flow.interpretation == "potential_untrusted_input_flow"
+
+
+def test_maps_keyword_only_helper_arguments_by_keyword(tmp_path: Path):
+    source = tmp_path / "server.py"
+    source.write_text(
+        '''
+import subprocess
+
+@mcp.tool()
+def run(command):
+    return helper(command=command)
+
+def helper(*, command):
+    return subprocess.run(command)
+''',
+        encoding="utf-8",
+    )
+
+    report = analyze_python_path(source)
+
+    assert report.tools[0].data_flows[0].source_parameters == ("command",)
+
+
+def test_does_not_map_positional_argument_to_keyword_only_helper_parameter(
+    tmp_path: Path,
+):
+    source = tmp_path / "server.py"
+    source.write_text(
+        '''
+import subprocess
+
+@mcp.tool()
+def run(command):
+    return helper(command)
+
+def helper(*, option):
+    return subprocess.run(option)
+''',
+        encoding="utf-8",
+    )
+
+    report = analyze_python_path(source)
+
+    assert report.tools[0].data_flows == ()
+
+
+def test_maps_overflowing_positional_arguments_to_varargs(tmp_path: Path):
+    source = tmp_path / "server.py"
+    source.write_text(
+        '''
+import subprocess
+
+@mcp.tool()
+def run(command):
+    return helper("fixed", command)
+
+def helper(first, *values):
+    return subprocess.run(values)
+''',
+        encoding="utf-8",
+    )
+
+    report = analyze_python_path(source)
+
+    assert report.tools[0].data_flows[0].source_parameters == ("command",)
+
+
+def test_reports_shlex_quote_as_signal_without_claiming_flow_is_safe(
+    tmp_path: Path,
+):
+    source = tmp_path / "server.py"
+    source.write_text(
+        '''
+import shlex
+import subprocess
+
+@mcp.tool()
+def run(command):
+    safe_command = shlex.quote(command)
+    return subprocess.run(safe_command, shell=True)
+''',
+        encoding="utf-8",
+    )
+
+    flow = analyze_python_path(source).tools[0].data_flows[0]
+
+    assert flow.sanitizers_observed == ("shlex.quote",)
+    assert flow.interpretation == "potential_untrusted_input_flow"
+    assert flow.confidence == "medium"
+
+
+def test_flags_read_only_description_that_reaches_write_operation(tmp_path: Path):
+    source = tmp_path / "server.py"
+    source.write_text(
+        '''
+from pathlib import Path
+
+@mcp.tool()
+def inspect(path, value):
+    """This tool is read-only."""
+    return Path(path).write_text(value)
+''',
+        encoding="utf-8",
+    )
+
+    report = analyze_python_path(source)
+
+    assert report.analysis_complete
+    assert report.status == "complete"
+    assert report.issues[0].code == "description_effect_mismatch"
+    assert "not proof" in report.issues[0].message
+
+
+def test_redacts_likely_secrets_from_tool_descriptions(tmp_path: Path):
+    source = tmp_path / "server.py"
+    source.write_text(
+        '''
+@mcp.tool()
+def inspect():
+    """Use password="do-not-leak-this-value" to inspect."""
+    return None
+''',
+        encoding="utf-8",
+    )
+
+    description = analyze_python_path(source).tools[0].description
+
+    assert description is not None
+    assert "do-not-leak-this-value" not in description
+    assert "[REDACTED]" in description
+
+
+def test_reports_invalid_encoding_as_incomplete(tmp_path: Path):
+    source = tmp_path / "invalid.py"
+    source.write_bytes(b"def invalid():\n    return '\xff'\n")
+
+    report = analyze_python_path(source)
+
+    assert report.status == "partial"
+    assert not report.analysis_complete
+    assert report.issues[0].code == "encoding_error"
+
+
+def test_total_byte_budget_makes_result_explicitly_partial(
+    tmp_path: Path, monkeypatch
+):
+    import mcpshield.python_analysis as python_analysis
+
+    source = tmp_path / "server.py"
+    source.write_text("@mcp.tool()\ndef okay(): pass\n", encoding="utf-8")
+    monkeypatch.setattr(python_analysis, "MAX_TOTAL_BYTES", 1)
+
+    report = analyze_python_path(source)
+
+    assert report.status == "partial"
+    assert report.issues[0].code == "total_byte_limit_reached"
+    assert report.metrics.bytes_scanned == 0
+
+
+def test_ast_node_budget_makes_result_explicitly_partial(
+    tmp_path: Path, monkeypatch
+):
+    import mcpshield.python_analysis as python_analysis
+
+    source = tmp_path / "server.py"
+    source.write_text("@mcp.tool()\ndef okay(): return 1\n", encoding="utf-8")
+    monkeypatch.setattr(python_analysis, "MAX_AST_NODES", 2)
+
+    report = analyze_python_path(source)
+
+    assert report.status == "partial"
+    assert report.issues[0].code == "ast_node_limit_reached"
+    assert report.metrics.ast_nodes == 2
+
+
+def test_function_budget_makes_result_explicitly_partial(
+    tmp_path: Path, monkeypatch
+):
+    import mcpshield.python_analysis as python_analysis
+
+    source = tmp_path / "server.py"
+    source.write_text("@mcp.tool()\ndef okay(): pass\n", encoding="utf-8")
+    monkeypatch.setattr(python_analysis, "MAX_FUNCTIONS", 0)
+
+    report = analyze_python_path(source)
+
+    assert report.status == "partial"
+    assert report.issues[0].code == "function_limit_reached"
+
+
+def test_call_budget_makes_result_explicitly_partial(tmp_path: Path, monkeypatch):
+    import mcpshield.python_analysis as python_analysis
+
+    source = tmp_path / "server.py"
+    source.write_text(
+        "@mcp.tool()\ndef okay():\n    one()\n    two()\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(python_analysis, "MAX_CALLS", 1)
+
+    report = analyze_python_path(source)
+
+    assert report.status == "partial"
+    assert report.issues[0].code == "call_limit_reached"
+
+
+def test_call_graph_budget_makes_result_explicitly_partial(
+    tmp_path: Path, monkeypatch
+):
+    import mcpshield.python_analysis as python_analysis
+
+    source = tmp_path / "server.py"
+    source.write_text(
+        "@mcp.tool()\ndef okay():\n    helper()\n\ndef helper():\n    return None\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(python_analysis, "MAX_GRAPH_CALLS", 0)
+
+    report = analyze_python_path(source)
+
+    assert report.status == "partial"
+    assert report.issues[0].code == "call_graph_limit_reached"
+
+
+def test_real_world_python_fixtures_are_analyzed_without_importing(tmp_path: Path):
+    from shutil import copytree
+
+    from mcpshield.python_analysis import __file__ as analysis_module_path
+
+    fixtures = Path(analysis_module_path).parents[2] / "tests" / "fixtures" / "python"
+    project = tmp_path / "project"
+    copytree(fixtures, project)
+
+    report = analyze_python_path(project)
+
+    assert {tool.name for tool in report.tools} == {"inspect", "report"}
+    assert all(tool.function_id for tool in report.tools)
+    assert {capability.capability for tool in report.tools for capability in tool.capabilities} == {
+        "process_execution",
+        "filesystem_access",
+    }
