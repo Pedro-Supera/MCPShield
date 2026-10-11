@@ -10,8 +10,11 @@ class Rule:
     severity: str
     title: str
     description: str
-    pattern: re.Pattern[str]
+    pattern: re.Pattern[str] | None
     recommendation: str
+    cwe_id: str | None = None
+    examples: tuple[str, ...] = ()
+    limitations: tuple[str, ...] = ()
 
 
 RULES = (
@@ -59,7 +62,89 @@ RULES = (
     ),
 )
 
+ANALYSIS_RULES = (
+    Rule(
+        "MCP101",
+        "info",
+        "Process execution capability",
+        "A recognized process API call is reachable from a statically identified MCP tool.",
+        None,
+        "Review command construction, argument validation, and required process permissions.",
+        examples=("subprocess.run(command)", "os.system(command)"),
+        limitations=("A source call does not prove that a process is started at runtime.",),
+    ),
+    Rule(
+        "MCP102",
+        "info",
+        "Filesystem capability",
+        "A recognized filesystem API call is reachable from a statically identified MCP tool.",
+        None,
+        "Review the paths, access mode, and minimum filesystem permissions required.",
+        examples=('Path(path).read_text()', 'open(path, "w")'),
+        limitations=("The analyzer does not establish the runtime path or resulting file contents.",),
+    ),
+    Rule(
+        "MCP103",
+        "info",
+        "Network capability",
+        "A recognized network API call is reachable from a statically identified MCP tool.",
+        None,
+        "Review destinations, authentication, data sent, and network access requirements.",
+        examples=('requests.get(url)', 'socket.connect(address)'),
+        limitations=("The analyzer does not establish the runtime destination or whether a connection succeeds.",),
+    ),
+    Rule(
+        "MCP201",
+        "medium",
+        "Tool input reaches process API",
+        "A tool parameter may reach an argument of a recognized process API.",
+        None,
+        "Review command construction, shell mode, argument separation, and context-specific sanitization.",
+        limitations=("This is a conservative static flow; it is not proof of command injection or exploitability.",),
+    ),
+    Rule(
+        "MCP202",
+        "medium",
+        "Tool input reaches filesystem API",
+        "A tool parameter may reach a path argument of a recognized filesystem API.",
+        None,
+        "Review path normalization, allowed roots, and whether the operation can escape the intended scope.",
+        limitations=("The analyzer does not evaluate path normalization, runtime values, or filesystem state.",),
+    ),
+    Rule(
+        "MCP203",
+        "medium",
+        "Tool input reaches network API",
+        "A tool parameter may reach a destination argument of a recognized network API.",
+        None,
+        "Review destination allowlists, redirect handling, authentication, and SSRF exposure.",
+        limitations=("This is not proof of SSRF or successful network access.",),
+    ),
+    Rule(
+        "MCP204",
+        "medium",
+        "Description and source effect differ",
+        "A tool description appears to deny an effect that a reachable source call suggests.",
+        None,
+        "Review the human-visible description and implementation together; do not infer intent from the mismatch.",
+        limitations=("Description matching is lexical and may misinterpret natural language.",),
+    ),
+    Rule(
+        "MCP901",
+        "warning",
+        "Static analysis incomplete",
+        "A source file, traversal, or analysis budget prevented full processing of the selected inputs.",
+        None,
+        "Resolve the reported input issue or adjust the source set before treating the inventory as complete.",
+        limitations=("Completeness covers only discovered source and implemented static-analysis patterns.",),
+    ),
+)
+
 
 def matching_rules(line: str) -> list[Rule]:
     """Return rules whose patterns match a single line."""
-    return [rule for rule in RULES if rule.pattern.search(line)]
+    return [
+        rule
+        for rule in RULES
+        if rule.pattern is not None and rule.pattern.search(line)
+    ]
