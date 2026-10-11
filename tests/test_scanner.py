@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pytest
 
+import mcpshield.scanner as scanner
 from mcpshield.scanner import ScanError, scan_path, scan_text
 
 
@@ -54,6 +55,33 @@ def test_rejects_symlink(tmp_path: Path):
 def test_missing_path_raises_scan_error(tmp_path: Path):
     with pytest.raises(ScanError, match="does not exist"):
         scan_path(tmp_path / "missing")
+
+
+def test_oversized_file_fails_explicitly(tmp_path: Path, monkeypatch):
+    source = tmp_path / "SKILL.md"
+    source.write_text("x" * 10, encoding="utf-8")
+    monkeypatch.setattr(scanner, "MAX_FILE_BYTES", 5)
+
+    with pytest.raises(ScanError, match="exceeds the 5-byte scan limit"):
+        scan_path(source)
+
+
+def test_aggregate_file_limit_fails_explicitly(tmp_path: Path, monkeypatch):
+    (tmp_path / "first.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "second.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(scanner, "MAX_SCAN_FILES", 1)
+
+    with pytest.raises(ScanError, match="1-file limit"):
+        scan_path(tmp_path)
+
+
+def test_aggregate_byte_limit_fails_explicitly(tmp_path: Path, monkeypatch):
+    (tmp_path / "first.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "second.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(scanner, "MAX_SCAN_TOTAL_BYTES", 3)
+
+    with pytest.raises(ScanError, match="3-byte total limit"):
+        scan_path(tmp_path)
 
 
 def test_finding_has_recommendation_and_location():
